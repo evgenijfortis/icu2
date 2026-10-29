@@ -1,0 +1,1707 @@
+name: Auto-Create & Build ICU Diary APK (AQ Key Support)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build_apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Generate Project, Inject Code & Build APK
+        run: |
+          # 1. Создаем чистый Flutter-проект для Android
+          flutter create --platforms=android --org com.reanimatologist.diary icu_diary
+          cd icu_diary
+
+          # 2. Прописываем разрешения для камеры и интернета в AndroidManifest.xml
+          sed -i 's/<application/<uses-permission android:name="android.permission.CAMERA"\/><uses-permission android:name="android.permission.INTERNET"\/><application/' android/app/src/main/AndroidManifest.xml
+
+          # 3. Автоматически создаем pubspec.yaml (с пакетом http для ключей AQ...)
+          cat << 'EOF' > pubspec.yaml
+          name: icu_diary
+          description: Дневник врача-реаниматолога с Gemini AI (поддержка AQ API Key) и клиническими шкалами.
+          publish_to: 'none'
+          version: 1.0.1+2
+
+          environment:
+            sdk: '>=3.2.0 <4.0.0'
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            image_picker: ^1.0.7
+            http: ^1.2.1
+            shared_preferences: ^2.2.2
+
+          dev_dependencies:
+            flutter_test:
+              sdk: flutter
+            flutter_lints: ^3.0.0
+
+          flutter:
+            uses-material-design: true
+          EOF
+
+          # 4. Записываем полный код приложения с поддержкой ключей AQ... в lib/main.dart
+          cat << 'EOF' > lib/main.dart
+          import 'dart:convert';
+          import 'dart:io';
+          import 'package:flutter/material.dart';
+          import 'package:image_picker/image_picker.dart';
+          import 'package:http/http.dart' as http;
+          import 'package:shared_preferences/shared_preferences.dart';
+
+          // Вы можете сразу вписать сюда свой ключ AQ..., чтобы не вводить его в приложении вручную:
+          const String defaultAqApiKey = '';
+
+          void main() {
+            runApp(const ReanimatologistApp());
+          }
+
+          class ReanimatologistApp extends StatelessWidget {
+            const ReanimatologistApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: 'Дневник Реаниматолога + Gemini AI',
+                debugShowCheckedModeBanner: false,
+                theme: ThemeData(
+                  colorScheme: ColorScheme.fromSeed(
+                    seedColor: const Color(0xFF005B96),
+                    brightness: Brightness.light,
+                  ),
+                  useMaterial3: true,
+                ),
+                home: const PatientListScreen(),
+              );
+            }
+          }
+
+          // ============================================================================
+          // СЕРВИС ПРЯМОГО ОБРАЩЕНИЯ К GEMINI (ПОДДЕРЖКА КЛЮЧЕЙ AQ... И AIza...)
+          // ============================================================================
+
+          class GeminiMedicalService {
+            static const String _apiKeyPref = 'gemini_api_key';
+
+            static const String _systemPrompt = '''
+          Ты — экспертный ИИ-ассистент врача-анестезиолога-реаниматолога в Республике Беларусь.
+          При анализе любых бланков анализов (ОАК, Б/Х, КЩС, коагулограмма, ОАМ) и инструментальных исследований (КТ, УЗИ):
+          1. Оценивай показатели строго в контексте интенсивной терапии и реанимации.
+          2. Сравнивай новые показатели с предыдущими данными пациента в динамике (указывай тренды: нарастание лактата, динамика ПКТ/СРБ, сдвиги КЩС, динамика креатинина и СКФ, коагулопатия).
+          3. Давай полные клинические рекомендации согласно клиническим протоколам МЗ РБ и международным гайдлайнам: указывай конкретные международные непатентованные названия (МНН) лекарственных средств, точные дозировки (мг/кг, мкг/кг/мин), кратность введения, скорость инфузии/титрования и альтернативные препараты выбора с учетом функции почек/печени и массы тела пациента.
+          ''';
+
+            static Future<String?> getApiKey() async {
+              final prefs = await SharedPreferences.getInstance();
+              final saved = prefs.getString(_apiKeyPref);
+              if (saved != null && saved.trim().isNotEmpty) {
+                return saved.trim();
+              }
+              if (defaultAqApiKey.trim().isNotEmpty) {
+                return defaultAqApiKey.trim();
+              }
+              return null;
+            }
+
+            static Future<void> setApiKey(String key) async {
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setString(_apiKeyPref, key.trim());
+            }
+
+            /// Универсальный метод отправки запроса к Gemini (поддерживает AQ... Vertex AI и AIza... AI Studio)
+            static Future<String> _callGeminiEndpoint({
+              required String prompt,
+              String? base64Image,
+              required bool expectJson,
+            }) async {
+              final apiKey = await getApiKey();
+              if (apiKey == null || apiKey.isEmpty) {
+                throw Exception('API-ключ (AQ...) не задан. Нажмите на иконку ключа в верхнем меню.');
+              }
+
+              final List> parts = [
+                {'text': prompt}
+              ];
+
+              if (base64Image != null) {
+                parts.add({
+                  'inlineData': {
+                    'mimeType': 'image/jpeg',
+                    'data': base64Image,
+                  }
+                });
+              }
+
+              final Map<String, dynamic> requestBody = {
+                'systemInstruction': {
+                  'parts': [
+                    {'text': _systemPrompt}
+                  ]
+                },
+                'contents': [
+                  {
+                    'role': 'user',
+                    'parts': parts,
+                  }
+                ],
+                'generationConfig': {
+                  'temperature': 0.2,
+                  if (expectJson) 'responseMimeType': 'application/json',
+                }
+              };
+
+              // Если ключ начинается с AQ — используем шлюз Vertex AI Express Mode,
+              // при этом предусмотрен автоматический фоллбэк на случай прокси-шлюзов
+              final bool isAqKey = apiKey.startsWith('AQ');
+
+              final List<Uri> endpoints = isAqKey
+                  ? [
+                      Uri.parse('https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-2.5-flash:generateContent?key=$apiKey'),
+                      Uri.parse('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey'),
+                    ]
+                  : [
+                      Uri.parse('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey'),
+                      Uri.parse('https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-2.5-flash:generateContent?key=$apiKey'),
+                    ];
+
+              String lastError = '';
+
+              for (final url in endpoints) {
+                try {
+                  final response = await http.post(
+                    url,
+                    headers: {
+                      'Content-Type': 'application/json',
+                      'x-goog-api-key': apiKey,
+                    },
+                    body: jsonEncode(requestBody),
+                  );
+
+                  if (response.statusCode == 200) {
+                    final decoded = jsonDecode(utf8.decode(response.bodyBytes));
+                    final candidates = decoded['candidates'] as List?;
+                    if (candidates != null && candidates.isNotEmpty) {
+                      final contentParts = candidates[0]['content']['parts'] as List;
+                      return contentParts[0]['text'].toString();
+                    }
+                  } else {
+                    lastError = 'HTTP ${response.statusCode}: ${utf8.decode(response.bodyBytes)}';
+                  }
+                } catch (e) {
+                  lastError = e.toString();
+                }
+              }
+
+              throw Exception('Не удалось выполнить запрос с ключом: $lastError');
+            }
+
+            static Future> analyzeMedicalPhoto({
+              required File imageFile,
+              required Patient patient,
+              required String category,
+            }) async {
+              final sameCategoryHistory = patient.records
+                  .where((r) => r.category == category)
+                  .map((r) => 'Дата: ${r.dateOnForm}\nДанные: ${r.extractedData}')
+                  .join('\n---\n');
+
+              final otherRecentRecords = patient.records
+                  .where((r) => r.category != category)
+                  .take(5)
+                  .map((r) => '[${r.category} от ${r.dateOnForm}]: ${r.extractedData}')
+                  .join('\n');
+
+              final age = DateTime.now().year - patient.birthYear;
+              final imageBytes = await imageFile.readAsBytes();
+              final base64Image = base64Encode(imageBytes);
+
+              final prompt = '''
+          Проанализируй фотографию медицинского бланка категории: "$category".
+
+          ДАННЫЕ ПАЦИЕНТА ОРИТ:
+          - Пол: ${patient.gender}, Возраст: $age лет (${patient.birthYear} г.р.)
+          - Рост: ${patient.heightCm} см, Фактический вес: ${patient.weightKg} кг
+          - ИМТ: ${patient.bmi.toStringAsFixed(1)} кг/м², Идеальная масса тела (IBW): ${patient.idealBodyWeight.toStringAsFixed(1)} кг
+
+          ПРЕДЫДУЩИЕ ИССЛЕДОВАНИЯ ЭТОЙ ЖЕ КАТЕГОРИИ ($category) ДЛЯ ОЦЕНКИ ДИНАМИКИ:
+          ${sameCategoryHistory.isEmpty ? 'Предыдущих бланков этой категории нет (первичное внесение).' : sameCategoryHistory}
+
+          ДРУГИЕ НЕДАВНИЕ ДАННЫЕ ПАЦИЕНТА:
+          ${otherRecentRecords.isEmpty ? 'Нет данных.' : otherRecentRecords}
+
+          Верни JSON строго со следующей структурой:
+          {
+            "date": "Дата анализа с бланка в формате ДД.ММ.ГГГГ (если на бланке не видна дата, укажи сегодняшнюю)",
+            "extracted_data": "Полная и точная расшифровка всех цифр, показателей и текста заключения с фотографии с единицами измерения",
+            "dynamic_and_recommendations": "1) Сравнение с предыдущими анализами по пунктам (динамика).\n2) Патофизиологическая интерпретация (КЩС, электролиты, органная дисфункция).\n3) Рекомендации по коррекции и лечению с указанием препаратов, точных дозировок (в пересчете на ${patient.weightKg} кг / IBW ${patient.idealBodyWeight.toStringAsFixed(1)} кг), кратности введения и альтернативных вариантов терапии."
+          }
+          ''';
+
+              final rawText = await _callGeminiEndpoint(
+                prompt: prompt,
+                base64Image: base64Image,
+                expectJson: true,
+              );
+
+              final cleanedJson = rawText
+                  .replaceAll('```json', '')
+                  .replaceAll('```', '')
+                  .trim();
+
+              return jsonDecode(cleanedJson) as Map<String, dynamic>;
+            }
+
+            static Future<String> askConsilium({
+              required Patient patient,
+              required String doctorQuestion,
+            }) async {
+              final age = DateTime.now().year - patient.birthYear;
+              final allHistory = patient.records
+                  .map((r) => '=== ${r.category} (от ${r.dateOnForm}) ===\nПоказатели: ${r.extractedData}\nВыводы: ${r.aiRecommendation}')
+                  .join('\n\n');
+
+              final prompt = '''
+          Пациент ОРИТ: ${patient.fullName}, Пол: ${patient.gender}, Возраст: $age лет.
+          Рост: ${patient.heightCm} см, Вес: ${patient.weightKg} кг (Идеальная масса тела IBW: ${patient.idealBodyWeight.toStringAsFixed(1)} кг, ИМТ: ${patient.bmi.toStringAsFixed(1)}).
+
+          Полный дневник анализов и обследований пациента:
+          ${allHistory.isEmpty ? 'Анализы еще не внесены.' : allHistory}
+
+          Вопрос лечащего врача-реаниматолога:
+          "$doctorQuestion"
+
+          Дай четкий, структурированный ответ с препаратами, расчетом дозировок на вес пациента, кратностью введения и альтернативами.
+          ''';
+
+              return await _callGeminiEndpoint(
+                prompt: prompt,
+                expectJson: false,
+              );
+            }
+          }
+
+          class MedicalRecord {
+            final String id;
+            final String category;
+            final String dateOnForm;
+            final String extractedData;
+            final String aiRecommendation;
+
+            MedicalRecord({
+              required this.id,
+              required this.category,
+              required this.dateOnForm,
+              required this.extractedData,
+              required this.aiRecommendation,
+            });
+
+            Map<String, dynamic> toJson() => {
+                  'id': id,
+                  'category': category,
+                  'dateOnForm': dateOnForm,
+                  'extractedData': extractedData,
+                  'aiRecommendation': aiRecommendation,
+                };
+
+            factory MedicalRecord.fromJson(Map<String, dynamic> json) => MedicalRecord(
+                  id: json['id'],
+                  category: json['category'],
+                  dateOnForm: json['dateOnForm'],
+                  extractedData: json['extractedData'],
+                  aiRecommendation: json['aiRecommendation'],
+                );
+          }
+
+          class Patient {
+            String id;
+            String fullName;
+            String gender;
+            int birthYear;
+            double heightCm;
+            double weightKg;
+            List<MedicalRecord> records;
+
+            Patient({
+              required this.id,
+              required this.fullName,
+              required this.gender,
+              required this.birthYear,
+              required this.heightCm,
+              required this.weightKg,
+              List<MedicalRecord>? records,
+            }) : records = records ?? [];
+
+            double get bmi => heightCm > 0 ? weightKg / ((heightCm / 100) * (heightCm / 100)) : 0;
+
+            double get idealBodyWeight {
+              if (heightCm <= 0) return 0;
+              double base = gender == 'М' ? 50.0 : 45.5;
+              return base + 0.91 * (heightCm - 152.4);
+            }
+
+            Map<String, dynamic> toJson() => {
+                  'id': id,
+                  'fullName': fullName,
+                  'gender': gender,
+                  'birthYear': birthYear,
+                  'heightCm': heightCm,
+                  'weightKg': weightKg,
+                  'records': records.map((r) => r.toJson()).toList(),
+                };
+
+            factory Patient.fromJson(Map<String, dynamic> json) => Patient(
+                  id: json['id'],
+                  fullName: json['fullName'],
+                  gender: json['gender'],
+                  birthYear: json['birthYear'],
+                  heightCm: (json['heightCm'] as num).toDouble(),
+                  weightKg: (json['weightKg'] as num).toDouble(),
+                  records: (json['records'] as List)
+                      .map((r) => MedicalRecord.fromJson(r))
+                      .toList(),
+                );
+          }
+
+          class PatientListScreen extends StatefulWidget {
+            const PatientListScreen({super.key});
+
+            @override
+            State<PatientListScreen> createState() => _PatientListScreenState();
+          }
+
+          class _PatientListScreenState extends State<PatientListScreen> {
+            List<Patient> patients = [];
+            bool _hasKey = false;
+
+            @override
+            void initState() {
+              super.initState();
+              _loadPatients();
+              _checkApiKey();
+            }
+
+            Future<void> _checkApiKey() async {
+              final key = await GeminiMedicalService.getApiKey();
+              setState(() {
+                _hasKey = key != null && key.isNotEmpty;
+              });
+            }
+
+            Future<void> _loadPatients() async {
+              final prefs = await SharedPreferences.getInstance();
+              final String? data = prefs.getString('icu_patients');
+              if (data != null) {
+                final List decoded = jsonDecode(data);
+                setState(() {
+                  patients = decoded.map((e) => Patient.fromJson(e)).toList();
+                });
+              }
+            }
+
+            Future<void> _savePatients() async {
+              final prefs = await SharedPreferences.getInstance();
+              final String encoded = jsonEncode(patients.map((p) => p.toJson()).toList());
+              await prefs.setString('icu_patients', encoded);
+            }
+
+            Future<void> _showApiKeyDialog() async {
+              final currentKey = await GeminiMedicalService.getApiKey() ?? '';
+              final keyCtrl = TextEditingController(text: currentKey);
+
+              if (!mounted) return;
+              showDialog(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: const Row(
+                    children: [
+                      Icon(Icons.vpn_key, color: Colors.blue),
+                      SizedBox(width: 8),
+                      Text('Ключ Gemini API (AQ...)'),
+                    ],
+                  ),
+                  content: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Вставьте ваш API-ключ, начинающийся на AQ... (Vertex AI / Google Cloud) или AIza...:',
+                        style: TextStyle(fontSize: 13),
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: keyCtrl,
+                        decoration: const InputDecoration(
+                          labelText: 'AQ...',
+                          hintText: 'AQ.Ab8RN6...',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                    ],
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(ctx),
+                      child: const Text('Отмена'),
+                    ),
+                    ElevatedButton(
+                      onPressed: () async {
+                        await GeminiMedicalService.setApiKey(keyCtrl.text);
+                        await _checkApiKey();
+                        if (ctx.mounted) Navigator.pop(ctx);
+                        if (mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('Ключ AQ успешно сохранен!')),
+                          );
+                        }
+                      },
+                      child: const Text('Сохранить'),
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            void _showAddPatientDialog() {
+              final nameCtrl = TextEditingController();
+              final yearCtrl = TextEditingController();
+              final heightCtrl = TextEditingController();
+              final weightCtrl = TextEditingController();
+              String gender = 'М';
+
+              showDialog(
+                context: context,
+                builder: (ctx) => StatefulBuilder(
+                  builder: (context, setDialogState) => AlertDialog(
+                    title: const Text('Новый пациент ОРИТ'),
+                    content: SingleChildScrollView(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          TextField(
+                            controller: nameCtrl,
+                            decoration: const InputDecoration(labelText: 'ФИО / Номер койки'),
+                          ),
+                          const SizedBox(height: 8),
+                          DropdownButtonFormField<String>(
+                            value: gender,
+                            decoration: const InputDecoration(labelText: 'Пол'),
+                            items: const [
+                              DropdownMenuItem(value: 'М', child: Text('Мужской')),
+                              DropdownMenuItem(value: 'Ж', child: Text('Женский')),
+                            ],
+                            onChanged: (val) => setDialogState(() => gender = val!),
+                          ),
+                          TextField(
+                            controller: yearCtrl,
+                            keyboardType: TextInputType.number,
+                            decoration: const InputDecoration(labelText: 'Год рождения (напр. 1965)'),
+                          ),
+                          TextField(
+                            controller: heightCtrl,
+                            keyboardType: TextInputType.number,
+                            decoration: const InputDecoration(labelText: 'Рост (см)'),
+                          ),
+                          TextField(
+                            controller: weightCtrl,
+                            keyboardType: TextInputType.number,
+                            decoration: const InputDecoration(labelText: 'Вес (кг)'),
+                          ),
+                        ],
+                      ),
+                    ),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(ctx),
+                        child: const Text('Отмена'),
+                      ),
+                      ElevatedButton(
+                        onPressed: () {
+                          if (nameCtrl.text.isEmpty) return;
+                          final newPatient = Patient(
+                            id: DateTime.now().millisecondsSinceEpoch.toString(),
+                            fullName: nameCtrl.text,
+                            gender: gender,
+                            birthYear: int.tryParse(yearCtrl.text) ?? 1970,
+                            heightCm: double.tryParse(heightCtrl.text) ?? 170,
+                            weightKg: double.tryParse(weightCtrl.text) ?? 70,
+                          );
+                          setState(() => patients.add(newPatient));
+                          _savePatients();
+                          Navigator.pop(ctx);
+                        },
+                        child: const Text('Добавить'),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(
+                  title: const Text('Дневник Реаниматолога'),
+                  backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+                  actions: [
+                    IconButton(
+                      tooltip: 'Настроить ключ Gemini API (AQ...)',
+                      icon: Icon(
+                        Icons.vpn_key,
+                        color: _hasKey ? Colors.green.shade800 : Colors.red,
+                      ),
+                      onPressed: _showApiKeyDialog,
+                    ),
+                  ],
+                ),
+                body: Column(
+                  children: [
+                    if (!_hasKey)
+                      MaterialBanner(
+                        backgroundColor: Colors.amber.shade100,
+                        content: const Text(
+                          'Для работы ИИ-анализа бланков укажите ваш API-ключ AQ... (иконка ключа вверху).',
+                          style: TextStyle(fontSize: 13),
+                        ),
+                        actions: [
+                          TextButton(
+                            onPressed: _showApiKeyDialog,
+                            child: const Text('Ввести ключ AQ'),
+                          ),
+                        ],
+                      ),
+                    Expanded(
+                      child: patients.isEmpty
+                          ? const Center(
+                              child: Text(
+                                'Список пациентов пуст.\nНажмите «+ Пациент», чтобы добавить карточку.',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(fontSize: 16, color: Colors.grey),
+                              ),
+                            )
+                          : ListView.builder(
+                              padding: const EdgeInsets.all(8),
+                              itemCount: patients.length,
+                              itemBuilder: (ctx, i) {
+                                final p = patients[i];
+                                final age = DateTime.now().year - p.birthYear;
+                                return Card(
+                                  elevation: 2,
+                                  child: ListTile(
+                                    leading: CircleAvatar(
+                                      backgroundColor:
+                                          p.gender == 'М' ? Colors.blue.shade100 : Colors.pink.shade100,
+                                      child: Text(p.gender, style: const TextStyle(fontWeight: FontWeight.bold)),
+                                    ),
+                                    title: Text(p.fullName, style: const TextStyle(fontWeight: FontWeight.bold)),
+                                    subtitle: Text(
+                                      '$age лет (${p.birthYear} г.р.) | Рост: ${p.heightCm.toInt()} см, Вес: ${p.weightKg} кг\n'
+                                      'ИМТ: ${p.bmi.toStringAsFixed(1)} | IBW: ${p.idealBodyWeight.toStringAsFixed(1)} кг\n'
+                                      'Анализов в дневнике: ${p.records.length}',
+                                    ),
+                                    isThreeLine: true,
+                                    trailing: IconButton(
+                                      icon: const Icon(Icons.delete_outline, color: Colors.red),
+                                      onPressed: () {
+                                        setState(() => patients.removeAt(i));
+                                        _savePatients();
+                                      },
+                                    ),
+                                    onTap: () async {
+                                      await Navigator.push(
+                                        context,
+                                        MaterialPageRoute(
+                                          builder: (_) => PatientDetailScreen(
+                                            patient: p,
+                                            onUpdate: _savePatients,
+                                          ),
+                                        ),
+                                      );
+                                      setState(() {});
+                                    },
+                                  ),
+                                );
+                              },
+                            ),
+                    ),
+                  ],
+                ),
+                floatingActionButton: FloatingActionButton.extended(
+                  onPressed: _showAddPatientDialog,
+                  icon: const Icon(Icons.person_add),
+                  label: const Text('Пациент'),
+                ),
+              );
+            }
+          }
+
+          class PatientDetailScreen extends StatefulWidget {
+            final Patient patient;
+            final VoidCallback onUpdate;
+
+            const PatientDetailScreen({
+              super.key,
+              required this.patient,
+              required this.onUpdate,
+            });
+
+            @override
+            State<PatientDetailScreen> createState() => _PatientDetailScreenState();
+          }
+
+          class _PatientDetailScreenState extends State<PatientDetailScreen> {
+            bool _isAnalyzing = false;
+            final ImagePicker _picker = ImagePicker();
+
+            final List<String> _categories = [
+              'Общий анализ крови (ОАК)',
+              'Биохимия крови (Б/Х)',
+              'КЩС и газы крови',
+              'Коагулограмма',
+              'Общий анализ мочи (ОАМ)',
+              'Заключение КТ',
+              'Заключение УЗИ',
+            ];
+
+            Future<void> _scanAndAnalyzeDocument(String category, ImageSource source) async {
+              final XFile? photo = await _picker.pickImage(source: source, imageQuality: 85);
+              if (photo == null) return;
+
+              setState(() => _isAnalyzing = true);
+
+              try {
+                final result = await GeminiMedicalService.analyzeMedicalPhoto(
+                  imageFile: File(photo.path),
+                  patient: widget.patient,
+                  category: category,
+                );
+
+                final newRecord = MedicalRecord(
+                  id: DateTime.now().millisecondsSinceEpoch.toString(),
+                  category: category,
+                  dateOnForm: result['date']?.toString() ?? 'Не определена',
+                  extractedData: result['extracted_data']?.toString() ?? 'Нет данных',
+                  aiRecommendation: result['dynamic_and_recommendations']?.toString() ?? 'Нет рекомендаций',
+                );
+
+                setState(() {
+                  widget.patient.records.insert(0, newRecord);
+                });
+                widget.onUpdate();
+              } catch (e) {
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      backgroundColor: Colors.red.shade700,
+                      content: Text('Ошибка обращения к Gemini: $e'),
+                    ),
+                  );
+                }
+              } finally {
+                setState(() => _isAnalyzing = false);
+              }
+            }
+
+            void _showAddRecordSheet() {
+              String selectedCategory = _categories.first;
+              showModalBottomSheet(
+                context: context,
+                builder: (ctx) => StatefulBuilder(
+                  builder: (context, setModalState) => Padding(
+                    padding: const EdgeInsets.all(16.0),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const Text(
+                          'Сфотографировать бланк для анализа в Gemini',
+                          style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+                        ),
+                        const SizedBox(height: 12),
+                        DropdownButtonFormField<String>(
+                          value: selectedCategory,
+                          decoration: const InputDecoration(
+                            labelText: 'Выберите вид исследования',
+                            border: OutlineInputBorder(),
+                          ),
+                          items: _categories
+                              .map((c) => DropdownMenuItem(value: c, child: Text(c)))
+                              .toList(),
+                          onChanged: (val) => setModalState(() => selectedCategory = val!),
+                        ),
+                        const SizedBox(height: 16),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: ElevatedButton.icon(
+                                icon: const Icon(Icons.camera_alt),
+                                label: const Text('Камера'),
+                                onPressed: () {
+                                  Navigator.pop(ctx);
+                                  _scanAndAnalyzeDocument(selectedCategory, ImageSource.camera);
+                                },
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: OutlinedButton.icon(
+                                icon: const Icon(Icons.photo_library),
+                                label: const Text('Из галереи'),
+                                onPressed: () {
+                                  Navigator.pop(ctx);
+                                  _scanAndAnalyzeDocument(selectedCategory, ImageSource.gallery);
+                                },
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            }
+
+            void _showGeminiConsiliumSheet() {
+              final questionCtrl = TextEditingController();
+              String aiAnswer = '';
+              bool loading = false;
+
+              showModalBottomSheet(
+                context: context,
+                isScrollControlled: true,
+                builder: (ctx) => StatefulBuilder(
+                  builder: (context, setModalState) => Padding(
+                    padding: EdgeInsets.only(
+                      left: 16,
+                      right: 16,
+                      top: 16,
+                      bottom: MediaQuery.of(context).viewInsets.bottom + 16,
+                    ),
+                    child: SingleChildScrollView(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          const Row(
+                            children: [
+                              Icon(Icons.psychology, color: Colors.deepPurple),
+                              SizedBox(width: 8),
+                              Text(
+                                'ИИ-Консилиум Gemini по пациенту',
+                                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          const Text(
+                            'Gemini учитывает рост, вес, возраст и все загруженные бланки анализов этого пациента.',
+                            style: TextStyle(fontSize: 12, color: Colors.grey),
+                          ),
+                          const SizedBox(height: 12),
+                          TextField(
+                            controller: questionCtrl,
+                            maxLines: 3,
+                            decoration: const InputDecoration(
+                              hintText: 'Задайте вопрос по коррекции терапии, дозировкам или инфузии...',
+                              border: OutlineInputBorder(),
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          ElevatedButton.icon(
+                            icon: loading
+                                ? const SizedBox(
+                                    width: 18,
+                                    height: 18,
+                                    child: CircularProgressIndicator(strokeWidth: 2),
+                                  )
+                                : const Icon(Icons.send),
+                            label: Text(loading ? 'Gemini анализирует...' : 'Спросить Gemini'),
+                            onPressed: loading
+                                ? null
+                                : () async {
+                                    if (questionCtrl.text.trim().isEmpty) return;
+                                    setModalState(() => loading = true);
+                                    try {
+                                      final ans = await GeminiMedicalService.askConsilium(
+                                        patient: widget.patient,
+                                        doctorQuestion: questionCtrl.text,
+                                      );
+                                      setModalState(() => aiAnswer = ans);
+                                    } catch (e) {
+                                      setModalState(() => aiAnswer = 'Ошибка: $e');
+                                    } finally {
+                                      setModalState(() => loading = false);
+                                    }
+                                  },
+                          ),
+                          if (aiAnswer.isNotEmpty) ...[
+                            const Divider(height: 24),
+                            Container(
+                              padding: const EdgeInsets.all(12),
+                              decoration: BoxDecoration(
+                                color: Colors.deepPurple.shade50,
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: SelectableText(
+                                aiAnswer,
+                                style: const TextStyle(fontSize: 14),
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final p = widget.patient;
+              return DefaultTabController(
+                length: 3,
+                child: Scaffold(
+                  appBar: AppBar(
+                    title: Text(p.fullName),
+                    actions: [
+                      IconButton(
+                        tooltip: 'Спросить Gemini по пациенту',
+                        icon: const Icon(Icons.psychology_alt),
+                        onPressed: _showGeminiConsiliumSheet,
+                      ),
+                    ],
+                    bottom: const TabBar(
+                      tabs: [
+                        Tab(icon: Icon(Icons.assignment), text: 'Дневник / Анализы'),
+                        Tab(icon: Icon(Icons.calculate), text: 'Шкалы ОРИТ'),
+                        Tab(icon: Icon(Icons.person), text: 'Антропометрия'),
+                      ],
+                    ),
+                  ),
+                  body: TabBarView(
+                    children: [
+                      _buildDiaryTab(),
+                      const ClinicalScalesTab(),
+                      _buildAnthropometryTab(),
+                    ],
+                  ),
+                  floatingActionButton: FloatingActionButton.extended(
+                    onPressed: _isAnalyzing ? null : _showAddRecordSheet,
+                    icon: _isAnalyzing
+                        ? const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                          )
+                        : const Icon(Icons.add_a_photo),
+                    label: Text(_isAnalyzing ? 'Gemini читает бланк...' : 'Скан бланка'),
+                  ),
+                ),
+              );
+            }
+
+            Widget _buildDiaryTab() {
+              if (widget.patient.records.isEmpty) {
+                return const Center(
+                  child: Padding(
+                    padding: EdgeInsets.all(24.0),
+                    child: Text(
+                      'Дневник пациента пуст.\nНажмите «Скан бланка», чтобы сфотографировать ОАК, Б/Х, КЩС, Коагулограмму, ОАМ, КТ или УЗИ.',
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+                );
+              }
+
+              return ListView.builder(
+                padding: const EdgeInsets.all(10),
+                itemCount: widget.patient.records.length,
+                itemBuilder: (ctx, i) {
+                  final rec = widget.patient.records[i];
+                  return Card(
+                    margin: const EdgeInsets.only(bottom: 12),
+                    child: ExpansionTile(
+                      initiallyExpanded: i == 0,
+                      leading: const Icon(Icons.medical_information, color: Colors.blue),
+                      title: Text(
+                        rec.category,
+                        style: const TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                      subtitle: Text('Дата анализа (с бланка): ${rec.dateOnForm}'),
+                      trailing: IconButton(
+                        icon: const Icon(Icons.delete_outline, size: 20),
+                        onPressed: () {
+                          setState(() => widget.patient.records.removeAt(i));
+                          widget.onUpdate();
+                        },
+                      ),
+                      children: [
+                        Padding(
+                          padding: const EdgeInsets.all(12.0),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text(
+                                'Распознанные показатели с бланка:',
+                                style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blueGrey),
+                              ),
+                              const SizedBox(height: 4),
+                              SelectableText(rec.extractedData),
+                              const Divider(height: 20),
+                              Container(
+                                padding: const EdgeInsets.all(12),
+                                decoration: BoxDecoration(
+                                  color: Colors.amber.shade50,
+                                  borderRadius: BorderRadius.circular(8),
+                                  border: Border.all(color: Colors.amber.shade300),
+                                ),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    const Row(
+                                      children: [
+                                        Icon(Icons.auto_awesome, size: 18, color: Colors.deepOrange),
+                                        SizedBox(width: 6),
+                                        Expanded(
+                                          child: Text(
+                                            'Заключение Gemini (Динамика и коррекция терапии):',
+                                            style: TextStyle(
+                                              fontWeight: FontWeight.bold,
+                                              color: Colors.deepOrange,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                    const SizedBox(height: 8),
+                                    SelectableText(rec.aiRecommendation),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              );
+            }
+
+            Widget _buildAnthropometryTab() {
+              final p = widget.patient;
+              final heightCtrl = TextEditingController(text: p.heightCm.toString());
+              final weightCtrl = TextEditingController(text: p.weightKg.toString());
+              final yearCtrl = TextEditingController(text: p.birthYear.toString());
+
+              return SingleChildScrollView(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    TextField(
+                      controller: yearCtrl,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(labelText: 'Год рождения'),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: heightCtrl,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(labelText: 'Рост (см)'),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: weightCtrl,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(labelText: 'Вес (кг)'),
+                    ),
+                    const SizedBox(height: 20),
+                    ElevatedButton.icon(
+                      icon: const Icon(Icons.save),
+                      label: const Text('Обновить антропометрию'),
+                      onPressed: () {
+                        setState(() {
+                          p.birthYear = int.tryParse(yearCtrl.text) ?? p.birthYear;
+                          p.heightCm = double.tryParse(heightCtrl.text) ?? p.heightCm;
+                          p.weightKg = double.tryParse(weightCtrl.text) ?? p.weightKg;
+                        });
+                        widget.onUpdate();
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('Данные пациента сохранены')),
+                        );
+                      },
+                    ),
+                    const Divider(height: 32),
+                    const Text(
+                      'Расчетные параметры для ОРИТ:',
+                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 8),
+                    Text('• Индекс массы тела (ИМТ): ${p.bmi.toStringAsFixed(1)} кг/м²'),
+                    Text('• Идеальная масса тела (IBW): ${p.idealBodyWeight.toStringAsFixed(1)} кг'),
+                    Text(
+                      '• Протективный дыхательный объем (6–8 мл/кг IBW): '
+                      '${(p.idealBodyWeight * 6).toInt()} – ${(p.idealBodyWeight * 8).toInt()} мл',
+                    ),
+                    Text(
+                      '• Базовая потребность в жидкости (30 мл/кг): ${(p.weightKg * 30).toInt()} мл/сут',
+                    ),
+                    Text(
+                      '• Целевой темп диуреза (>0.5 мл/кг/ч): >${(p.weightKg * 0.5).toStringAsFixed(1)} мл/час',
+                    ),
+                  ],
+                ),
+              );
+            }
+          }
+
+          class ClinicalScalesTab extends StatelessWidget {
+            const ClinicalScalesTab({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return ListView(
+                padding: const EdgeInsets.all(12),
+                children: const [
+                  _SectionHeader(title: '1. Шкалы оценки уровня сознания и седации'),
+                  GcsCalculatorCard(),
+                  FourScoreCalculatorCard(),
+                  RassReferenceCard(),
+                  SizedBox(height: 16),
+                  _SectionHeader(title: '2. ТЭЛА (Тромбоэмболия легочной артерии)'),
+                  WellsPeCalculatorCard(),
+                  GenevaPeCalculatorCard(),
+                  PesiCalculatorCard(),
+                  SizedBox(height: 16),
+                  _SectionHeader(title: '3. ОКС (Острый коронарный синдром)'),
+                  TimiCalculatorCard(),
+                  GraceReferenceCard(),
+                  CrusadeCalculatorCard(),
+                  KillipReferenceCard(),
+                  SizedBox(height: 16),
+                  _SectionHeader(title: '4. ФП (Фибрилляция предсердий)'),
+                  Cha2ds2VascCalculatorCard(),
+                  HasBledCalculatorCard(),
+                  EhraReferenceCard(),
+                  SizedBox(height: 80),
+                ],
+              );
+            }
+          }
+
+          class _SectionHeader extends StatelessWidget {
+            final String title;
+            const _SectionHeader({required this.title});
+
+            @override
+            Widget build(BuildContext context) {
+              return Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8.0),
+                child: Text(
+                  title,
+                  style: TextStyle(
+                    fontSize: 17,
+                    fontWeight: FontWeight.bold,
+                    color: Theme.of(context).colorScheme.primary,
+                  ),
+                ),
+              );
+            }
+          }
+
+          class GcsCalculatorCard extends StatefulWidget {
+            const GcsCalculatorCard({super.key});
+            @override
+            State<GcsCalculatorCard> createState() => _GcsCalculatorCardState();
+          }
+
+          class _GcsCalculatorCardState extends State<GcsCalculatorCard> {
+            int eye = 4, verbal = 5, motor = 6;
+            String _interpret(int total) {
+              if (total == 15) return 'Ясное сознание';
+              if (total >= 13) return 'Умеренное оглушение';
+              if (total >= 11) return 'Глубокое оглушение';
+              if (total >= 9) return 'Сопор';
+              if (total >= 6) return 'Умеренная кома (Кома I)';
+              if (total >= 4) return 'Глубокая кома (Кома II)';
+              return 'Запредельная / терминальная кома (Кома III)';
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              int total = eye + verbal + motor;
+              return Card(
+                child: ExpansionTile(
+                  title: const Text('Шкала комы Глазго (GCS)'),
+                  subtitle: Text('Итог: $total б. — ${_interpret(total)}'),
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.all(12),
+                      child: Column(
+                        children: [
+                          DropdownButtonFormField<int>(
+                            value: eye,
+                            decoration: const InputDecoration(labelText: 'Открывание глаз (E)'),
+                            items: const [
+                              DropdownMenuItem(value: 4, child: Text('4 — Произвольное')),
+                              DropdownMenuItem(value: 3, child: Text('3 — На обращенную речь')),
+                              DropdownMenuItem(value: 2, child: Text('2 — На болевой стимул')),
+                              DropdownMenuItem(value: 1, child: Text('1 — Отсутствует')),
+                            ],
+                            onChanged: (v) => setState(() => eye = v!),
+                          ),
+                          DropdownButtonFormField<int>(
+                            value: verbal,
+                            decoration: const InputDecoration(labelText: 'Речевая реакция (V)'),
+                            items: const [
+                              DropdownMenuItem(value: 5, child: Text('5 — Ориентирован, быстрый ответ')),
+                              DropdownMenuItem(value: 4, child: Text('4 — Спутанная речь')),
+                              DropdownMenuItem(value: 3, child: Text('3 — Отдельные неадекватные слова')),
+                              DropdownMenuItem(value: 2, child: Text('2 — Нечленораздельные звуки')),
+                              DropdownMenuItem(value: 1, child: Text('1 — Отсутствует / Интубирован (V1/T)')),
+                            ],
+                            onChanged: (v) => setState(() => verbal = v!),
+                          ),
+                          DropdownButtonFormField<int>(
+                            value: motor,
+                            decoration: const InputDecoration(labelText: 'Двигательная реакция (M)'),
+                            items: const [
+                              DropdownMenuItem(value: 6, child: Text('6 — Выполнение команд')),
+                              DropdownMenuItem(value: 5, child: Text('5 — Локализация боли')),
+                              DropdownMenuItem(value: 4, child: Text('4 — Отдергивание конечности')),
+                              DropdownMenuItem(value: 3, child: Text('3 — Патологическое сгибание (декортикация)')),
+                              DropdownMenuItem(value: 2, child: Text('2 — Патологическое разгибание (децеребрация)')),
+                              DropdownMenuItem(value: 1, child: Text('1 — Отсутствует')),
+                            ],
+                            onChanged: (v) => setState(() => motor = v!),
+                          ),
+                        ],
+                      ),
+                    )
+                  ],
+                ),
+              );
+            }
+          }
+
+          class FourScoreCalculatorCard extends StatefulWidget {
+            const FourScoreCalculatorCard({super.key});
+            @override
+            State<FourScoreCalculatorCard> createState() => _FourScoreCalculatorCardState();
+          }
+
+          class _FourScoreCalculatorCardState extends State<FourScoreCalculatorCard> {
+            int e = 4, m = 4, b = 4, r = 4;
+            @override
+            Widget build(BuildContext context) {
+              int total = e + m + b + r;
+              return Card(
+                child: ExpansionTile(
+                  title: const Text('Шкала FOUR (углубленная оценка в ОРИТ / на ИВЛ)'),
+                  subtitle: Text('Итог: $total из 16 баллов'),
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.all(12),
+                      child: Column(
+                        children: [
+                          DropdownButtonFormField<int>(
+                            value: e,
+                            decoration: const InputDecoration(labelText: 'Глазные реакции (E)'),
+                            items: const [
+                              DropdownMenuItem(value: 4, child: Text('4 — Глаза открыты, слежение, мигание по команде')),
+                              DropdownMenuItem(value: 3, child: Text('3 — Глаза открыты, но нет слежения')),
+                              DropdownMenuItem(value: 2, child: Text('2 — Закрыты, открываются на громкий звук')),
+                              DropdownMenuItem(value: 1, child: Text('1 — Закрыты, открываются на боль')),
+                              DropdownMenuItem(value: 0, child: Text('0 — Глаза остаются закрытыми на боль')),
+                            ],
+                            onChanged: (v) => setState(() => e = v!),
+                          ),
+                          DropdownButtonFormField<int>(
+                            value: m,
+                            decoration: const InputDecoration(labelText: 'Двигательные реакции (M)'),
+                            items: const [
+                              DropdownMenuItem(value: 4, child: Text('4 — Выполнение команд (знак "отлично", кулак)')),
+                              DropdownMenuItem(value: 3, child: Text('3 — Локализация боли')),
+                              DropdownMenuItem(value: 2, child: Text('2 — Сгибательный ответ на боль')),
+                              DropdownMenuItem(value: 1, child: Text('1 — Разгибательный ответ на боль')),
+                              DropdownMenuItem(value: 0, child: Text('0 — Нет ответа или миоклонус')),
+                            ],
+                            onChanged: (v) => setState(() => m = v!),
+                          ),
+                          DropdownButtonFormField<int>(
+                            value: b,
+                            decoration: const InputDecoration(labelText: 'Стволовые рефлексы (B)'),
+                            items: const [
+                              DropdownMenuItem(value: 4, child: Text('4 — Зрачковый и роговичный сохранены')),
+                              DropdownMenuItem(value: 3, child: Text('3 — Один зрачок расширен и фиксирован')),
+                              DropdownMenuItem(value: 2, child: Text('2 — Нет зрачкового ИЛИ роговичного')),
+                              DropdownMenuItem(value: 1, child: Text('1 — Нет зрачкового И роговичного')),
+                              DropdownMenuItem(value: 0, child: Text('0 — Нет зрачкового, роговичного и кашлевого')),
+                            ],
+                            onChanged: (v) => setState(() => b = v!),
+                          ),
+                          DropdownButtonFormField<int>(
+                            value: r,
+                            decoration: const InputDecoration(labelText: 'Дыхательный паттерн (R)'),
+                            items: const [
+                              DropdownMenuItem(value: 4, child: Text('4 — Не интубирован, регулярное дыхание')),
+                              DropdownMenuItem(value: 3, child: Text('3 — Не интубирован, Чейна-Стокса')),
+                              DropdownMenuItem(value: 2, child: Text('2 — Не интубирован, нерегулярное дыхание')),
+                              DropdownMenuItem(value: 1, child: Text('1 — Дышит сверх частоты ИВЛ')),
+                              DropdownMenuItem(value: 0, child: Text('0 — Апноэ или полностью синхронен с ИВЛ')),
+                            ],
+                            onChanged: (v) => setState(() => r = v!),
+                          ),
+                        ],
+                      ),
+                    )
+                  ],
+                ),
+              );
+            }
+          }
+
+          class RassReferenceCard extends StatelessWidget {
+            const RassReferenceCard({super.key});
+            @override
+            Widget build(BuildContext context) {
+              return const Card(
+                child: ExpansionTile(
+                  title: Text('Шкала RASS и AVPU (Ажитация / Седация)'),
+                  subtitle: Text('Целевой уровень в ОРИТ: от 0 до -2'),
+                  children: [
+                    Padding(
+                      padding: EdgeInsets.all(12),
+                      child: Text(
+                        '+4 Буйный | +3 Выраженное возбуждение | +2 Возбужден | +1 Беспокоен\n'
+                        ' 0 Спокоен и внимателен\n'
+                        '-1 Сонлив | -2 Легкая седация | -3 Умеренная седация | -4 Глубокая седация | -5 Нет пробуждения\n\n'
+                        'AVPU: A (В сознании) — V (На голос) — P (На боль) — U (Не реагирует)',
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }
+          }
+
+          class WellsPeCalculatorCard extends StatefulWidget {
+            const WellsPeCalculatorCard({super.key});
+            @override
+            State<WellsPeCalculatorCard> createState() => _WellsPeCalculatorCardState();
+          }
+
+          class _WellsPeCalculatorCardState extends State<WellsPeCalculatorCard> {
+            final Map<String, double> criteria = {
+              'Клинические признаки ТГВ': 3.0,
+              'Альтернативный диагноз менее вероятен, чем ТЭЛА': 3.0,
+              'Тахикардия (ЧСС > 100 уд/мин)': 1.5,
+              'Иммобилизация ≥3 дней или операция за последние 4 нед.': 1.5,
+              'ТГВ или ТЭЛА в анамнезе': 1.5,
+              'Кровохарканье': 1.0,
+              'Активное онкологическое заболевание': 1.0,
+            };
+            final Set<String> selected = {};
+
+            @override
+            Widget build(BuildContext context) {
+              double score = selected.fold(0.0, (sum, key) => sum + criteria[key]!);
+              String risk = score > 6 ? 'Высокий риск ТЭЛА' : (score >= 2 ? 'Умеренный риск' : 'Низкий риск');
+              return Card(
+                child: ExpansionTile(
+                  title: const Text('Шкала Уэллса (Wells) для ТЭЛА'),
+                  subtitle: Text('Баллы: $score — $risk'),
+                  children: criteria.entries
+                      .map((e) => CheckboxListTile(
+                            title: Text(e.key),
+                            subtitle: Text('+${e.value} б.'),
+                            value: selected.contains(e.key),
+                            onChanged: (val) => setState(() => val! ? selected.add(e.key) : selected.remove(e.key)),
+                          ))
+                      .toList(),
+                ),
+              );
+            }
+          }
+
+          class GenevaPeCalculatorCard extends StatefulWidget {
+            const GenevaPeCalculatorCard({super.key});
+            @override
+            State<GenevaPeCalculatorCard> createState() => _GenevaPeCalculatorCardState();
+          }
+
+          class _GenevaPeCalculatorCardState extends State<GenevaPeCalculatorCard> {
+            final Map<String, int> criteria = {
+              'Возраст > 65 лет': 1,
+              'ТГВ или ТЭЛА в анамнезе': 3,
+              'Операция или перелом за последний месяц': 2,
+              'Активная онкология': 2,
+              'Односторонняя боль в нижней конечности': 3,
+              'Кровохарканье': 2,
+              'ЧСС 75–94 уд/мин': 3,
+              'ЧСС ≥ 95 уд/мин (доп. +2 б.)': 2,
+              'Боль при пальпации вен и односторонний отек': 4,
+            };
+            final Set<String> selected = {};
+
+            @override
+            Widget build(BuildContext context) {
+              int score = selected.fold(0, (sum, k) => sum + criteria[k]!);
+              String risk = score >= 11 ? 'Высокая вероятность' : (score >= 4 ? 'Промежуточная' : 'Низкая');
+              return Card(
+                child: ExpansionTile(
+                  title: const Text('Женевская шкала (Geneva) для ТЭЛА'),
+                  subtitle: Text('Баллы: $score — $risk'),
+                  children: criteria.entries
+                      .map((e) => CheckboxListTile(
+                            title: Text(e.key),
+                            subtitle: Text('+${e.value} б.'),
+                            value: selected.contains(e.key),
+                            onChanged: (v) => setState(() => v! ? selected.add(e.key) : selected.remove(e.key)),
+                          ))
+                      .toList(),
+                ),
+              );
+            }
+          }
+
+          class PesiCalculatorCard extends StatefulWidget {
+            const PesiCalculatorCard({super.key});
+            @override
+            State<PesiCalculatorCard> createState() => _PesiCalculatorCardState();
+          }
+
+          class _PesiCalculatorCardState extends State<PesiCalculatorCard> {
+            final Map<String, int> spesi = {
+              'Возраст > 80 лет': 1,
+              'Онкологическое заболевание в анамнезе': 1,
+              'ХСН или ХОБЛ': 1,
+              'ЧСС ≥ 110 уд/мин': 1,
+              'Систолическое АД < 100 мм рт. ст.': 1,
+              'Сатурация SpO2 < 90%': 1,
+            };
+            final Set<String> selected = {};
+
+            @override
+            Widget build(BuildContext context) {
+              int score = selected.length;
+              String risk = score == 0 ? 'Низкий риск (1.0%)' : 'Высокий риск 30-дневной летальности (10.9%)';
+              return Card(
+                child: ExpansionTile(
+                  title: const Text('Индекс тяжести ТЭЛА (sPESI)'),
+                  subtitle: Text('Баллы: $score — $risk'),
+                  children: spesi.entries
+                      .map((e) => CheckboxListTile(
+                            title: Text(e.key),
+                            value: selected.contains(e.key),
+                            onChanged: (v) => setState(() => v! ? selected.add(e.key) : selected.remove(e.key)),
+                          ))
+                      .toList(),
+                ),
+              );
+            }
+          }
+
+          class TimiCalculatorCard extends StatefulWidget {
+            const TimiCalculatorCard({super.key});
+            @override
+            State<TimiCalculatorCard> createState() => _TimiCalculatorCardState();
+          }
+
+          class _TimiCalculatorCardState extends State<TimiCalculatorCard> {
+            final List<String> items = [
+              'Возраст ≥ 65 лет',
+              '≥ 3 факторов риска ИБС',
+              'Известный стеноз коронарных артерий ≥ 50%',
+              'Прием АСК в последние 7 суток',
+              '≥ 2 приступов стенокардии за 24 ч',
+              'Девиация сегмента ST ≥ 0.5 мм',
+              'Повышение тропонина / КФК-МВ',
+            ];
+            final Set<int> checked = {};
+
+            @override
+            Widget build(BuildContext context) {
+              int score = checked.length;
+              String risk = score <= 2 ? 'Низкий риск' : (score <= 4 ? 'Средний риск' : 'Высокий риск');
+              return Card(
+                child: ExpansionTile(
+                  title: const Text('Шкала TIMI (Риск при ОКС)'),
+                  subtitle: Text('Баллы: $score из 7 — $risk'),
+                  children: List.generate(
+                    items.length,
+                    (i) => CheckboxListTile(
+                      title: Text(items[i]),
+                      value: checked.contains(i),
+                      onChanged: (v) => setState(() => v! ? checked.add(i) : checked.remove(i)),
+                    ),
+                  ),
+                ),
+              );
+            }
+          }
+
+          class GraceReferenceCard extends StatefulWidget {
+            const GraceReferenceCard({super.key});
+            @override
+            State<GraceReferenceCard> createState() => _GraceReferenceCardState();
+          }
+
+          class _GraceReferenceCardState extends State<GraceReferenceCard> {
+            double age = 65, hr = 85, sbp = 120, creat = 100;
+            int killip = 1;
+            bool arrest = false, stDev = false, markers = false;
+
+            int _calculateGrace() {
+              int pts = 0;
+              if (age >= 80) pts += 91; else if (age >= 70) pts += 73; else if (age >= 60) pts += 55; else if (age >= 50) pts += 36; else if (age >= 40) pts += 18;
+              if (hr >= 150) pts += 38; else if (hr >= 110) pts += 24; else if (hr >= 90) pts += 15; else if (hr >= 70) pts += 9;
+              if (sbp < 80) pts += 58; else if (sbp < 100) pts += 53; else if (sbp < 120) pts += 43; else if (sbp < 140) pts += 34; else if (sbp < 160) pts += 24; else if (sbp < 200) pts += 10;
+              if (creat >= 353) pts += 28; else if (creat >= 177) pts += 21; else if (creat >= 106) pts += 10; else if (creat >= 71) pts += 7; else pts += 4;
+              if (killip == 2) pts += 20; if (killip == 3) pts += 39; if (killip == 4) pts += 59;
+              if (arrest) pts += 39; if (stDev) pts += 28; if (markers) pts += 14;
+              return pts;
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              int score = _calculateGrace();
+              String risk = score > 140 ? 'Высокий риск (>3%)' : (score >= 109 ? 'Умеренный риск (1–3%)' : 'Низкий риск (<1%)');
+              return Card(
+                child: ExpansionTile(
+                  title: const Text('Шкала GRACE (Летальность при ОКС)'),
+                  subtitle: Text('Баллы: $score — $risk'),
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.all(12),
+                      child: Column(
+                        children: [
+                          Text('Возраст: ${age.toInt()} лет'),
+                          Slider(value: age, min: 30, max: 95, onChanged: (v) => setState(() => age = v)),
+                          Text('ЧСС: ${hr.toInt()} уд/мин'),
+                          Slider(value: hr, min: 40, max: 180, onChanged: (v) => setState(() => hr = v)),
+                          Text('САД: ${sbp.toInt()} мм рт. ст.'),
+                          Slider(value: sbp, min: 60, max: 220, onChanged: (v) => setState(() => sbp = v)),
+                          Text('Креатинин: ${creat.toInt()} мкмоль/л'),
+                          Slider(value: creat, min: 40, max: 400, onChanged: (v) => setState(() => creat = v)),
+                          DropdownButtonFormField<int>(
+                            value: killip,
+                            decoration: const InputDecoration(labelText: 'Класс Killip'),
+                            items: const [
+                              DropdownMenuItem(value: 1, child: Text('Killip I — Нет СН')),
+                              DropdownMenuItem(value: 2, child: Text('Killip II — Хрипы <50%')),
+                              DropdownMenuItem(value: 3, child: Text('Killip III — Отек легких')),
+                              DropdownMenuItem(value: 4, child: Text('Killip IV — Кардиогенный шок')),
+                            ],
+                            onChanged: (v) => setState(() => killip = v!),
+                          ),
+                          CheckboxListTile(title: const Text('Остановка сердца при поступлении'), value: arrest, onChanged: (v) => setState(() => arrest = v!)),
+                          CheckboxListTile(title: const Text('Девиация сегмента ST'), value: stDev, onChanged: (v) => setState(() => stDev = v!)),
+                          CheckboxListTile(title: const Text('Повышение тропонина'), value: markers, onChanged: (v) => setState(() => markers = v!)),
+                        ],
+                      ),
+                    )
+                  ],
+                ),
+              );
+            }
+          }
+
+          class CrusadeCalculatorCard extends StatefulWidget {
+            const CrusadeCalculatorCard({super.key});
+            @override
+            State<CrusadeCalculatorCard> createState() => _CrusadeCalculatorCardState();
+          }
+
+          class _CrusadeCalculatorCardState extends State<CrusadeCalculatorCard> {
+            final Map<String, int> factors = {
+              'Исходный гематокрит < 31%': 9,
+              'Клиренс креатинина < 30 мл/мин': 35,
+              'ЧСС > 110 уд/мин': 8,
+              'Женский пол': 8,
+              'Признаки СН при поступлении': 7,
+              'Сосудистое заболевание в анамнезе': 6,
+              'Сахарный диабет': 6,
+              'САД ≤ 90 или ≥ 200 мм рт. ст.': 10,
+            };
+            final Set<String> selected = {};
+
+            @override
+            Widget build(BuildContext context) {
+              int score = selected.fold(0, (s, k) => s + factors[k]!);
+              String risk = score > 50 ? 'Очень высокий риск кровотечения' : (score > 40 ? 'Высокий риск' : (score > 30 ? 'Умеренный риск' : 'Низкий риск'));
+              return Card(
+                child: ExpansionTile(
+                  title: const Text('Шкала CRUSADE (Кровотечения при ОКС)'),
+                  subtitle: Text('Баллы: $score — $risk'),
+                  children: factors.entries
+                      .map((e) => CheckboxListTile(
+                            title: Text(e.key),
+                            subtitle: Text('+${e.value} б.'),
+                            value: selected.contains(e.key),
+                            onChanged: (v) => setState(() => v! ? selected.add(e.key) : selected.remove(e.key)),
+                          ))
+                      .toList(),
+                ),
+              );
+            }
+          }
+
+          class KillipReferenceCard extends StatelessWidget {
+            const KillipReferenceCard({super.key});
+            @override
+            Widget build(BuildContext context) {
+              return const Card(
+                child: ExpansionTile(
+                  title: Text('Классификация ОСН по Killip'),
+                  subtitle: Text('Стратификация при ОИМ'),
+                  children: [
+                    Padding(
+                      padding: EdgeInsets.all(12),
+                      child: Text(
+                        '• Killip I: Нет признаков СН\n'
+                        '• Killip II: Влажные хрипы <50% легочных полей\n'
+                        '• Killip III: Альвеолярный отек легких (>50% полей)\n'
+                        '• Killip IV: Кардиогенный шок (САД <90, олигурия, гипоперфузия)',
+                      ),
+                    )
+                  ],
+                ),
+              );
+            }
+          }
+
+          class Cha2ds2VascCalculatorCard extends StatefulWidget {
+            const Cha2ds2VascCalculatorCard({super.key});
+            @override
+            State<Cha2ds2VascCalculatorCard> createState() => _Cha2ds2VascCalculatorCardState();
+          }
+
+          class _Cha2ds2VascCalculatorCardState extends State<Cha2ds2VascCalculatorCard> {
+            final Map<String, int> criteria = {
+              'ХСН или ФВ ЛЖ ≤ 40% (C)': 1,
+              'Артериальная гипертензия (H)': 1,
+              'Возраст ≥ 75 лет (A2)': 2,
+              'Сахарный диабет (D)': 1,
+              'Инсульт / ТИА / ТЭ в анамнезе (S2)': 2,
+              'Сосудистое заболевание (ИМ, ПАБ) (V)': 1,
+              'Возраст 65–74 года (A)': 1,
+              'Женский пол (Sc)': 1,
+            };
+            final Set<String> selected = {};
+
+            @override
+            Widget build(BuildContext context) {
+              int score = selected.fold(0, (s, k) => s + criteria[k]!);
+              String rec = score >= 2 ? 'Показана антикоагулянтная терапия' : (score == 1 ? 'Рассмотреть ОАК' : 'Низкий риск');
+              return Card(
+                child: ExpansionTile(
+                  title: const Text('Шкала CHA₂DS₂-VASc (Риск инсульта при ФП)'),
+                  subtitle: Text('Баллы: $score — $rec'),
+                  children: criteria.entries
+                      .map((e) => CheckboxListTile(
+                            title: Text(e.key),
+                            subtitle: Text('+${e.value} б.'),
+                            value: selected.contains(e.key),
+                            onChanged: (v) => setState(() => v! ? selected.add(e.key) : selected.remove(e.key)),
+                          ))
+                      .toList(),
+                ),
+              );
+            }
+          }
+
+          class HasBledCalculatorCard extends StatefulWidget {
+            const HasBledCalculatorCard({super.key});
+            @override
+            State<HasBledCalculatorCard> createState() => _HasBledCalculatorCardState();
+          }
+
+          class _HasBledCalculatorCardState extends State<HasBledCalculatorCard> {
+            final List<String> items = [
+              'H — Неконтролируемая АГ (САД > 160 мм рт. ст.)',
+              'A — Нарушение функции почек (креатинин > 200 мкмоль/л)',
+              'A — Нарушение функции печени (цирроз, билирубин >2N)',
+              'S — Инсульт в анамнезе',
+              'B — Кровотечение в анамнезе или анемия',
+              'L — Лабильное МНО (<60% времени в целевом диапазоне)',
+              'E — Возраст > 65 лет',
+              'D — Прием антиагрегантов или НПВС',
+              'D — Алкоголь (≥ 8 порций в неделю)',
+            ];
+            final Set<int> checked = {};
+
+            @override
+            Widget build(BuildContext context) {
+              int score = checked.length;
+              String risk = score >= 3 ? 'Высокий риск кровотечений' : 'Низкий / умеренный риск';
+              return Card(
+                child: ExpansionTile(
+                  title: const Text('Шкала HAS-BLED (Риск кровотечений при ФП)'),
+                  subtitle: Text('Баллы: $score из 9 — $risk'),
+                  children: List.generate(
+                    items.length,
+                    (i) => CheckboxListTile(
+                      title: Text(items[i]),
+                      value: checked.contains(i),
+                      onChanged: (v) => setState(() => v! ? checked.add(i) : checked.remove(i)),
+                    ),
+                  ),
+                ),
+              );
+            }
+          }
+
+          class EhraReferenceCard extends StatelessWidget {
+            const EhraReferenceCard({super.key});
+            @override
+            Widget build(BuildContext context) {
+              return const Card(
+                child: ExpansionTile(
+                  title: Text('Шкала EHRA (Симптомы ФП)'),
+                  subtitle: Text('Классификация выраженности симптомов'),
+                  children: [
+                    Padding(
+                      padding: EdgeInsets.all(12),
+                      child: Text(
+                        '• EHRA I: Симптомов нет\n'
+                        '• EHRA IIa: Легкие (не беспокоят)\n'
+                        '• EHRA IIb: Умеренные (беспокоят, но не мешают активности)\n'
+                        '• EHRA III: Тяжелые (нарушена дневная активность)\n'
+                        '• EHRA IV: Инвалидизирующие',
+                      ),
+                    )
+                  ],
+                ),
+              );
+            }
+          }
+          EOF
+
+          # 5. Скачиваем пакеты и компилируем релизный APK
+          flutter pub get
+          flutter build apk --release
+
+      - name: Upload Compiled APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ICU-Diary-AQ-APK
+          path: icu_diary/build/app/outputs/flutter-apk/app-release.apk
